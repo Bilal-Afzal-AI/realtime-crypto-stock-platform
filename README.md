@@ -148,8 +148,8 @@ become its own service, container or repository without untangling imports.
 
 ## 5. Getting started
 
-Requires Python 3.12 and Git. Kafka, PostgreSQL and Airflow will run in Docker
-(added in `infra/`).
+Requires Python 3.12, Git and Docker Desktop. Kafka, PostgreSQL and Airflow
+run in Docker; see [infra/README.md](infra/README.md) to start them.
 
 ```bash
 git clone <repo-url>
@@ -170,7 +170,7 @@ cp .env.example .env    # then fill in API keys
 ## 6. Roadmap
 
 - [x] Project scaffold, dependencies, architecture documentation
-- [ ] `infra/docker-compose.yml` with Kafka, PostgreSQL, Airflow
+- [x] Local infra in Docker: ZooKeeper + Kafka + Schema Registry + Kafka UI, PostgreSQL, Airflow (CeleryExecutor). See [infra/README.md](infra/README.md)
 - [ ] Crypto websocket producer → `crypto.trades` topic
 - [ ] Stock REST producer → `stocks.quotes` topic
 - [ ] Lake writer consumer (bronze Parquet)

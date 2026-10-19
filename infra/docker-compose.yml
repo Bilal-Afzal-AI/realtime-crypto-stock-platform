@@ -1,0 +1,319 @@
+# Core data platform: ZooKeeper + Kafka, Schema Registry, Kafka UI, PostgreSQL.
+#
+# Airflow lives in a SEPARATE compose project (infra/airflow/docker-compose.yml)
+# and reaches these services over the shared `market-data-net` network. Two
+# projects instead of one because they have different lifecycles: you restart
+# or rebuild Airflow often while iterating on DAGs, and you don't want that to
+# bounce the broker or the warehouse (losing in-flight consumer state).
+#
+# Start this one FIRST, it creates the shared network:
+#   cd infra
+#   docker compose up -d --wait
+#
+# Every image is pinned to an exact version. `latest` means a teammate (or CI)
+# can silently get a different broker version than you tested against.
+
+name: market-platform
+
+# All Confluent Platform images below use the same release (7.9.2). Upgrade
+# them together; mixing CP versions is a common source of subtle bugs.
+#
+# RESOURCE LIMITS (deploy.resources.limits) are sized for a 2-core / 16 GB
+# laptop; see docs/phase-plans/phase-1-infrastructure.md. Memory limits are
+# hard (exceed it and the container is OOM-killed), so each JVM/Postgres is
+# also tuned to fit INSIDE its limit. CPU limits are soft caps: a container
+# hitting its cap just waits, so the caps add up to more than 4 on purpose.
+# 7.9 is the LAST Confluent line that supports ZooKeeper. CP 8.0+ (Kafka 4.x)
+# runs only in KRaft mode, where Kafka stores its own metadata. Migrating to
+# KRaft later means: remove the zookeeper service, add KAFKA_PROCESS_ROLES /
+# controller settings to the broker. Producers and consumers don't change.
+
+services:
+  # ---------------------------------------------------------------------------
+  # ZooKeeper: Kafka's metadata store in this (classic) mode. It tracks which
+  # brokers are alive, elects the controller broker, and stores topic configs
+  # and partition assignments. Kafka can't start without it.
+  # ---------------------------------------------------------------------------
+  zookeeper:
+    # 128 MB heap + JVM overhead. Mostly idle: only Kafka talks to it.
+    deploy:
+      resources:
+        limits:
+          cpus: "0.25"
+          memory: 256M
+    image: confluentinc/cp-zookeeper:7.9.2
+    hostname: zookeeper
+    container_name: zookeeper
+    restart: unless-stopped
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      # Base time unit (ms) for heartbeats and session timeouts.
+      ZOOKEEPER_TICK_TIME: 2000
+      # Whitelist the `ruok`/`srvr` admin commands used by the health check.
+      KAFKA_OPTS: "-Dzookeeper.4lw.commands.whitelist=ruok,srvr"
+      KAFKA_HEAP_OPTS: "-Xms128m -Xmx128m"
+    volumes:
+      # Lose these and ZooKeeper forgets every topic and partition assignment,
+      # while the broker's volume still holds the data: the two disagree and
+      # the broker refuses to start (cluster ID mismatch).
+      - zookeeper-data:/var/lib/zookeeper/data
+      - zookeeper-log:/var/lib/zookeeper/log
+    healthcheck:
+      # `ruok` -> `imok` means ZooKeeper is serving requests, not just running.
+      test: ["CMD-SHELL", "echo ruok | nc -w 2 localhost 2181 | grep -q imok"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 15s
+    # No ports published: only Kafka talks to ZooKeeper.
+    networks:
+      - market-data-net
+
+  # ---------------------------------------------------------------------------
+  # Kafka broker, single node.
+  # ---------------------------------------------------------------------------
+  kafka:
+    # 512 MB heap; the rest is OS page cache, which Kafka relies on for fast reads.
+    # 1.5 CPUs: at 1.0 the broker sat near its cap while producers ran, which
+    # slowed Schema Registry writes (it stores schemas in a Kafka topic) to
+    # ~40s. Consumers reading in phase three add more load on top of that.
+    deploy:
+      resources:
+        limits:
+          cpus: "1.5"
+          memory: 1G
+    image: confluentinc/cp-kafka:7.9.2
+    hostname: kafka
+    container_name: kafka
+    restart: unless-stopped
+    depends_on:
+      zookeeper:
+        condition: service_healthy
+    ports:
+      # Bound to 127.0.0.1 so the broker is not reachable from your LAN.
+      # Docker publishes ports by editing iptables/the Windows NAT directly,
+      # which means a plain "9092:9092" can bypass your host firewall.
+      - "127.0.0.1:${KAFKA_HOST_PORT:-9092}:9092"
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+
+      # Two client listeners, because "where is the broker?" has two answers:
+      #   INTERNAL  kafka:29092      for containers on the Docker network
+      #   EXTERNAL  localhost:9092   for producers you run on your laptop
+      # Kafka hands clients the ADVERTISED address after the first connection,
+      # so advertising only one of them breaks the other side. This is the #1
+      # "I can connect but can't produce" problem with Kafka in Docker.
+      KAFKA_LISTENERS: INTERNAL://0.0.0.0:29092,EXTERNAL://0.0.0.0:9092
+      KAFKA_ADVERTISED_LISTENERS: INTERNAL://kafka:29092,EXTERNAL://localhost:${KAFKA_HOST_PORT:-9092}
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: INTERNAL:PLAINTEXT,EXTERNAL:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: INTERNAL
+
+      # Internal topics default to replication factor 3; with one broker they
+      # could never be created, so consumer groups and transactions would hang.
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      # Skip the 3s wait before the first consumer-group rebalance (dev only).
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+
+      # Topics are created deliberately (see kafka-init below), never by a
+      # typo in a producer. Auto-create would happily make "crypto.trdes".
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
+
+      # Default heap is 1 GB; 512 MB is plenty for local volumes and leaves
+      # memory for Airflow, which is the hungry part of this stack.
+      KAFKA_HEAP_OPTS: "-Xms512m -Xmx512m"
+    volumes:
+      # Without this volume, `docker compose down` deletes every message.
+      # Consumers then have committed offsets pointing at data that no longer
+      # exists, and events not yet written to the lake are gone for good.
+      - kafka-data:/var/lib/kafka/data
+    healthcheck:
+      # "Process is running" is not "broker is serving". This asks the broker
+      # to answer a real protocol request on the internal listener.
+      test: ["CMD-SHELL", "kafka-broker-api-versions --bootstrap-server kafka:29092 > /dev/null 2>&1"]
+      interval: 10s
+      timeout: 10s
+      retries: 10
+      start_period: 30s
+    networks:
+      - market-data-net
+
+  # ---------------------------------------------------------------------------
+  # One-shot job: create the project's topics, then exit.
+  # Idempotent (--if-not-exists), so it is safe on every `up`. Topic configs
+  # will move to streaming/topics/ once producers exist; this keeps the stack
+  # usable from day one with auto-create turned off.
+  # ---------------------------------------------------------------------------
+  kafka-init:
+    # Short-lived CLI JVM; capped so it cannot spike while the broker starts.
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 384M
+    image: confluentinc/cp-kafka:7.9.2
+    container_name: kafka-init
+    restart: "no"
+    depends_on:
+      kafka:
+        condition: service_healthy
+    environment:
+      KAFKA_HEAP_OPTS: "-Xmx256m"
+    entrypoint: ["/bin/bash", "-c"]
+    command:
+      - |
+        set -e
+        for topic in crypto.trades stocks.quotes; do
+          kafka-topics --bootstrap-server kafka:29092 --create --if-not-exists \
+            --topic "$$topic" --partitions 3 --replication-factor 1
+        done
+        echo "Topics now on the broker:"
+        kafka-topics --bootstrap-server kafka:29092 --list
+    networks:
+      - market-data-net
+
+  # ---------------------------------------------------------------------------
+  # Schema Registry: the contract between producers and consumers.
+  # Producers register an Avro/Protobuf/JSON schema per topic; the registry
+  # rejects changes that would break existing consumers (compatibility rules).
+  # It stores schemas in a compacted Kafka topic (_schemas), so it is
+  # stateless itself and needs no volume. Kafka's volume IS its storage.
+  # ---------------------------------------------------------------------------
+  schema-registry:
+    # 256 MB heap + metaspace/threads. Java sits near its limit by design.
+    deploy:
+      resources:
+        limits:
+          cpus: "0.25"
+          memory: 448M
+    image: confluentinc/cp-schema-registry:7.9.2
+    hostname: schema-registry
+    container_name: schema-registry
+    restart: unless-stopped
+    depends_on:
+      kafka:
+        condition: service_healthy
+    ports:
+      - "127.0.0.1:${SCHEMA_REGISTRY_HOST_PORT:-8081}:8081"
+    environment:
+      SCHEMA_REGISTRY_HOST_NAME: schema-registry
+      SCHEMA_REGISTRY_KAFKASTORE_BOOTSTRAP_SERVERS: kafka:29092
+      SCHEMA_REGISTRY_LISTENERS: http://0.0.0.0:8081
+      # The topic holding schemas must survive; RF 1 because we have 1 broker.
+      SCHEMA_REGISTRY_KAFKASTORE_TOPIC_REPLICATION_FACTOR: 1
+      SCHEMA_REGISTRY_HEAP_OPTS: "-Xms256m -Xmx256m"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:8081/subjects > /dev/null"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+    networks:
+      - market-data-net
+
+  # ---------------------------------------------------------------------------
+  # Kafka UI: browse topics, messages, consumer lag and schemas in a browser.
+  # Pinned to v0.7.2, the last provectuslabs release; development continues
+  # in the community fork `kafbat/kafka-ui`, a drop-in swap if you need it.
+  # Host port 8085 because Airflow's UI takes 8080.
+  # ---------------------------------------------------------------------------
+  kafka-ui:
+    # 256 MB max heap.
+    deploy:
+      resources:
+        limits:
+          cpus: "0.25"
+          memory: 384M
+    image: provectuslabs/kafka-ui:v0.7.2
+    container_name: kafka-ui
+    restart: unless-stopped
+    depends_on:
+      kafka:
+        condition: service_healthy
+      # Deliberately NOT waiting on schema-registry, so Kafka UI can come up
+      # in stage one without it; the UI just shows the registry as offline.
+    ports:
+      - "127.0.0.1:${KAFKA_UI_HOST_PORT:-8085}:8080"
+    environment:
+      KAFKA_CLUSTERS_0_NAME: local
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:29092
+      KAFKA_CLUSTERS_0_SCHEMAREGISTRY: http://schema-registry:8081
+      # Config comes from this file only, not from edits made in the UI that
+      # would vanish on the next container recreate.
+      DYNAMIC_CONFIG_ENABLED: "false"
+      JAVA_OPTS: "-Xms128m -Xmx256m"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:8080/actuator/health | grep -q UP"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+    networks:
+      - market-data-net
+
+  # ---------------------------------------------------------------------------
+  # PostgreSQL 16: one server, two databases.
+  #   market   the local stand-in for the data warehouse (Snowflake/Redshift)
+  #   backend  the FastAPI app's own data (users, API keys), with its own role
+  # Created by infra/postgres/init/ on the FIRST start of an empty volume.
+  # Airflow does NOT use this database for its own metadata; it gets a
+  # separate Postgres in infra/airflow/. Mixing orchestrator bookkeeping with
+  # analytical tables means one runaway query or migration can take out both.
+  # ---------------------------------------------------------------------------
+  postgres:
+    # shared_buffers 128 MB + per-connection memory for up to 50 connections.
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 512M
+    image: postgres:16.6
+    hostname: postgres
+    container_name: warehouse-postgres
+    restart: unless-stopped
+    # Defaults assume a dedicated server; these keep Postgres inside 512 MB.
+    command: ["postgres", "-c", "shared_buffers=128MB", "-c", "max_connections=50"]
+    ports:
+      # 5433 on the host by default because a natively installed Postgres
+      # commonly owns 5432. Inside Docker it is still postgres:5432.
+      - "127.0.0.1:${POSTGRES_HOST_PORT:-5433}:5432"
+    environment:
+      # `:?` makes compose refuse to start if the value is missing, instead of
+      # silently creating a database with an empty password.
+      POSTGRES_USER: ${POSTGRES_USER:?set POSTGRES_USER in infra/.env}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in infra/.env}
+      POSTGRES_DB: ${POSTGRES_DB:-market}
+      # Read by infra/postgres/init/01-create-backend-db.sh
+      BACKEND_DB_NAME: ${BACKEND_DB_NAME:-backend}
+      BACKEND_DB_USER: ${BACKEND_DB_USER:?set BACKEND_DB_USER in infra/.env}
+      BACKEND_DB_PASSWORD: ${BACKEND_DB_PASSWORD:?set BACKEND_DB_PASSWORD in infra/.env}
+    volumes:
+      # Without this, every `docker compose down` wipes the warehouse.
+      - warehouse-pgdata:/var/lib/postgresql/data
+      # Scripts here run once, when the data directory is first created.
+      # Read-only: the container has no reason to modify its own setup code.
+      - ./postgres/init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      # pg_isready checks the server accepts connections for THIS db/user,
+      # which is what dependents actually need (not just "port open").
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+    networks:
+      - market-data-net
+
+volumes:
+  zookeeper-data:
+  zookeeper-log:
+  kafka-data:
+  warehouse-pgdata:
+
+networks:
+  # A fixed name (not the default "<project>_default") so the Airflow project
+  # can attach to it as an external network.
+  market-data-net:
+    name: market-data-net

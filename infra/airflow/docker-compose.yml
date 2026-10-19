@@ -1,0 +1,360 @@
+# Apache Airflow 3.0 with CeleryExecutor.
+#
+# Adapted from the official apache/airflow docker-compose.yaml for 3.0.2,
+# trimmed to what this project uses and wired into the platform network.
+#
+# Start the platform stack first (it creates `market-data-net`), then, from
+# the infra/ directory:
+#   docker compose --env-file .env -f airflow/docker-compose.yml up -d --build
+#
+# `--env-file .env` is needed because compose looks for .env next to the
+# compose file (infra/airflow/), and we keep ONE env file for all of infra/.
+#
+# Why CeleryExecutor and not LocalExecutor? Local runs tasks as subprocesses
+# of the scheduler: simple, but one heavy task can starve scheduling and you
+# cannot scale out. Celery puts tasks on a queue (Redis) consumed by separate
+# worker containers, which is how most production Airflow (and MWAA) runs.
+# You can `--scale airflow-worker=3` and see it work.
+
+name: market-airflow
+
+x-airflow-common: &airflow-common
+  build: .
+  image: market-airflow:3.0.2
+  environment: &airflow-common-env
+    AIRFLOW__CORE__EXECUTOR: CeleryExecutor
+    AIRFLOW__CORE__AUTH_MANAGER: airflow.providers.fab.auth_manager.fab_auth_manager.FabAuthManager
+    # Airflow's OWN metadata DB (DAG runs, task states, connections). Not the
+    # warehouse. See the airflow-postgres service below.
+    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://${AIRFLOW_DB_USER:?set AIRFLOW_DB_USER in infra/.env}:${AIRFLOW_DB_PASSWORD:?set AIRFLOW_DB_PASSWORD in infra/.env}@airflow-postgres/airflow
+    # Celery: Redis carries "run this task" messages; task results go to
+    # Postgres, which is durable, unlike Redis' in-memory store.
+    AIRFLOW__CELERY__BROKER_URL: redis://airflow-redis:6379/0
+    AIRFLOW__CELERY__RESULT_BACKEND: db+postgresql://${AIRFLOW_DB_USER}:${AIRFLOW_DB_PASSWORD}@airflow-postgres/airflow
+    # Encrypts passwords stored in Airflow Connections/Variables. If this is
+    # empty they are stored in plain text; if it changes, existing ones become
+    # unreadable. Generate once and keep it (see .env.example).
+    AIRFLOW__CORE__FERNET_KEY: ${AIRFLOW_FERNET_KEY:?set AIRFLOW_FERNET_KEY in infra/.env}
+    # Airflow 3 workers talk to the API server over HTTP using signed JWTs.
+    # Every component must share the same secret, otherwise each generates its
+    # own at startup and tasks fail with "Signature verification failed".
+    AIRFLOW__API_AUTH__JWT_SECRET: ${AIRFLOW_JWT_SECRET:?set AIRFLOW_JWT_SECRET in infra/.env}
+    AIRFLOW__API__SECRET_KEY: ${AIRFLOW_API_SECRET_KEY:?set AIRFLOW_API_SECRET_KEY in infra/.env}
+    AIRFLOW__CORE__EXECUTION_API_SERVER_URL: http://airflow-apiserver:8080/execution/
+    # New DAGs start paused so a half-written DAG never fires on its own.
+    AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: "true"
+    # The ~80 example DAGs are noise in a real project.
+    AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+    AIRFLOW__SCHEDULER__ENABLE_HEALTH_CHECK: "true"
+
+    # Laptop sizing (2 cores). See docs/phase-plans/phase-1-infrastructure.md.
+    # Default concurrency is 16 tasks per worker: on 2 cores that only thrashes.
+    AIRFLOW__CELERY__WORKER_CONCURRENCY: "2"
+    # The API server starts several worker processes by default (~150 MB each).
+    AIRFLOW__API__WORKERS: "1"
+    # Re-parse each DAG file every 60 s instead of 30 s: halves parsing CPU.
+    AIRFLOW__DAG_PROCESSOR__MIN_FILE_PROCESS_INTERVAL: "60"
+
+    # Connections to the platform services, defined as environment variables.
+    # Airflow reads any AIRFLOW_CONN_<ID> as a connection with id <id>.
+    # Env-defined connections are not stored in the metadata DB and can't be
+    # edited in the UI: config stays in code, the same idea as pulling them
+    # from a secrets backend in production.
+    AIRFLOW_CONN_MARKET_WAREHOUSE: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-market}
+    AIRFLOW_CONN_MARKET_KAFKA: '{"conn_type": "kafka", "extra": {"bootstrap.servers": "kafka:29092", "group.id": "airflow"}}'
+  volumes:
+    # DAGs and plugins are bind-mounted from the repo so edits show up without
+    # rebuilding the image. Logs land in orchestration/logs/ (git-ignored).
+    - ../../orchestration/dags:/opt/airflow/dags
+    - ../../orchestration/plugins:/opt/airflow/plugins
+    - ../../orchestration/logs:/opt/airflow/logs
+  user: "${AIRFLOW_UID:-50000}:0"
+  networks:
+    - airflow-internal
+  depends_on: &airflow-common-depends-on
+    airflow-redis:
+      condition: service_healthy
+    airflow-postgres:
+      condition: service_healthy
+
+services:
+  # ---------------------------------------------------------------------------
+  # Metadata database. Separate from the warehouse on purpose: Airflow's
+  # scheduler hammers this DB with small writes; analytics runs big scans.
+  # Isolating them means neither can slow down or corrupt the other, and you
+  # can wipe/upgrade one without touching the other.
+  # ---------------------------------------------------------------------------
+  airflow-postgres:
+    # Small metadata DB; connections capped at 50.
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 384M
+    image: postgres:16.6
+    container_name: airflow-postgres
+    restart: unless-stopped
+    command: ["postgres", "-c", "max_connections=50"]
+    environment:
+      POSTGRES_USER: ${AIRFLOW_DB_USER}
+      POSTGRES_PASSWORD: ${AIRFLOW_DB_PASSWORD}
+      POSTGRES_DB: airflow
+    volumes:
+      # Lose this volume and you lose every DAG run's history, all task
+      # states and any connections stored in the UI.
+      - airflow-pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d airflow"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+    networks:
+      - airflow-internal
+
+  # ---------------------------------------------------------------------------
+  # Redis: ONLY the Celery message broker. No port published; nothing outside
+  # this network needs it. Queued-but-not-started tasks live here; if Redis
+  # restarts they are lost, and the scheduler re-queues them because the
+  # source of truth for task state is the metadata DB, not Redis. That is why
+  # no persistent volume is needed for local work.
+  # ---------------------------------------------------------------------------
+  airflow-redis:
+    # Holds only queued task messages, a few KB each.
+    deploy:
+      resources:
+        limits:
+          cpus: "0.1"
+          memory: 128M
+    image: redis:7.2-bookworm
+    container_name: airflow-redis
+    restart: unless-stopped
+    # noeviction: if memory is full, refuse new writes rather than silently
+    # dropping queued tasks (the default for a cache, wrong for a broker).
+    command: ["redis-server", "--maxmemory", "64mb", "--maxmemory-policy", "noeviction"]
+    expose:
+      - "6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 5s
+    networks:
+      - airflow-internal
+
+  # ---------------------------------------------------------------------------
+  # API server: serves the UI and REST API, and (new in Airflow 3) the
+  # Execution API that workers call to report task state. It replaced the
+  # 2.x "webserver".
+  # ---------------------------------------------------------------------------
+  airflow-apiserver:
+    # One API worker process (AIRFLOW__API__WORKERS=1).
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 768M
+    <<: *airflow-common
+    container_name: airflow-apiserver
+    command: api-server
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:${AIRFLOW_API_HOST_PORT:-8080}:8080"
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:8080/api/v2/version"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    depends_on:
+      <<: *airflow-common-depends-on
+      airflow-init:
+        condition: service_completed_successfully
+
+  # Decides what should run and when, and puts it on the Celery queue.
+  airflow-scheduler:
+    # The scheduling loop is CPU-bound; gets the largest share after the worker.
+    deploy:
+      resources:
+        limits:
+          cpus: "0.75"
+          memory: 768M
+    <<: *airflow-common
+    container_name: airflow-scheduler
+    command: scheduler
+    restart: unless-stopped
+    healthcheck:
+      # Built-in endpoint that reports unhealthy if the scheduler loop has
+      # stopped heartbeating, even though the process is still alive.
+      test: ["CMD", "curl", "--fail", "http://localhost:8974/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    depends_on:
+      <<: *airflow-common-depends-on
+      airflow-init:
+        condition: service_completed_successfully
+
+  # Airflow 3 split DAG-file parsing out of the scheduler into its own process,
+  # so slow or broken DAG files can't stall scheduling.
+  airflow-dag-processor:
+    # Parses DAG files every 60 s. 1 GB: at 512 MB it sat pinned at the limit
+    # and was OOM-killed in the soak test.
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 1G
+    <<: *airflow-common
+    container_name: airflow-dag-processor
+    command: dag-processor
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", 'airflow jobs check --job-type DagProcessorJob --hostname "$${HOSTNAME}"']
+      interval: 30s
+      # The check starts a full Airflow CLI, which takes 10-20 s on 0.5 CPU.
+      timeout: 30s
+      retries: 5
+      start_period: 30s
+    depends_on:
+      <<: *airflow-common-depends-on
+      airflow-init:
+        condition: service_completed_successfully
+
+  # ---------------------------------------------------------------------------
+  # Celery worker: actually runs task code. This (and the triggerer) is the
+  # only part of Airflow that joins `market-data-net`, because tasks are what
+  # read Kafka and write the warehouse. The UI and scheduler have no business
+  # talking to the broker or the warehouse: least privilege, network edition.
+  # ---------------------------------------------------------------------------
+  airflow-worker:
+    # Runs task code, 2 tasks at a time (WORKER_CONCURRENCY=2).
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 1G
+    <<: *airflow-common
+    command: celery worker
+    restart: unless-stopped
+    environment:
+      <<: *airflow-common-env
+      # Lets Celery shut down gracefully on `docker stop` (finish or requeue
+      # the running task) instead of being killed mid-task.
+      DUMB_INIT_SETSID: "0"
+    networks:
+      - airflow-internal
+      - market-data-net
+    healthcheck:
+      test: ["CMD-SHELL", 'celery --app airflow.providers.celery.executors.celery_executor.app inspect ping -d "celery@$${HOSTNAME}"']
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    depends_on:
+      <<: *airflow-common-depends-on
+      airflow-apiserver:
+        condition: service_healthy
+      airflow-init:
+        condition: service_completed_successfully
+
+  # Runs deferrable operators/sensors (e.g. "wait for a Kafka message")
+  # asynchronously, so a waiting sensor doesn't occupy a whole worker slot.
+  # It may poll Kafka, so it also joins the platform network.
+  airflow-triggerer:
+    # Async loop for deferrable sensors; mostly idle. 768 MB: at 384 MB it was
+    # OOM-killed in the soak test (the Airflow runtime alone is ~380 MB).
+    deploy:
+      resources:
+        limits:
+          cpus: "0.25"
+          memory: 768M
+    <<: *airflow-common
+    container_name: airflow-triggerer
+    command: triggerer
+    restart: unless-stopped
+    networks:
+      - airflow-internal
+      - market-data-net
+    healthcheck:
+      test: ["CMD-SHELL", 'airflow jobs check --job-type TriggererJob --hostname "$${HOSTNAME}"']
+      interval: 30s
+      # Same slow CLI start as the DAG processor check, on only 0.25 CPU.
+      timeout: 30s
+      retries: 5
+      start_period: 30s
+    depends_on:
+      <<: *airflow-common-depends-on
+      airflow-init:
+        condition: service_completed_successfully
+
+  # ---------------------------------------------------------------------------
+  # One-shot setup: migrate the metadata DB schema and create the admin user,
+  # then exit. Every long-running component waits for this to complete
+  # successfully, so they never start against a half-migrated database.
+  # ---------------------------------------------------------------------------
+  airflow-init:
+    # One-shot DB migration; needs a burst, then exits.
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 1G
+    <<: *airflow-common
+    container_name: airflow-init
+    entrypoint: /bin/bash
+    command:
+      - -c
+      - |
+        mkdir -p /opt/airflow/logs /opt/airflow/dags /opt/airflow/plugins
+        chown -R "${AIRFLOW_UID:-50000}:0" /opt/airflow/logs
+        exec /entrypoint airflow version
+    environment:
+      <<: *airflow-common-env
+      _AIRFLOW_DB_MIGRATE: "true"
+      _AIRFLOW_WWW_USER_CREATE: "true"
+      _AIRFLOW_WWW_USER_USERNAME: ${AIRFLOW_ADMIN_USERNAME:?set AIRFLOW_ADMIN_USERNAME in infra/.env}
+      _AIRFLOW_WWW_USER_PASSWORD: ${AIRFLOW_ADMIN_PASSWORD:?set AIRFLOW_ADMIN_PASSWORD in infra/.env}
+    # Root only for the chown above; the entrypoint drops back to AIRFLOW_UID.
+    user: "0:0"
+    restart: "no"
+
+  # Optional Celery monitoring UI: `... --profile flower up -d`
+  airflow-flower:
+    # Optional monitoring UI.
+    deploy:
+      resources:
+        limits:
+          cpus: "0.25"
+          memory: 256M
+    <<: *airflow-common
+    container_name: airflow-flower
+    command: celery flower
+    profiles: ["flower"]
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:${AIRFLOW_FLOWER_HOST_PORT:-5555}:5555"
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:5555/"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    depends_on:
+      <<: *airflow-common-depends-on
+      airflow-init:
+        condition: service_completed_successfully
+
+volumes:
+  airflow-pgdata:
+
+networks:
+  # Private to Airflow: metadata DB and Redis are only reachable from here.
+  airflow-internal:
+    name: airflow-internal
+  # Created by infra/docker-compose.yml. `external: true` means this project
+  # joins it but never creates or deletes it, so `down` here can't break Kafka.
+  market-data-net:
+    external: true
