@@ -15,7 +15,12 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta
 
-from airflow.sdk import DAG, task
+from airflow.sdk import DAG, Asset, task
+
+# Published when this DAG finishes successfully. gold_to_warehouse is scheduled
+# on it, so the warehouse load runs right after gold is ready. Keep this
+# definition identical to the one in gold_to_warehouse.py.
+GOLD_ASSET = Asset(name="gold_ohlcv_1h", uri="file:///opt/airflow/data_lake/gold/ohlcv_1h")
 
 default_args = {
     "owner": "data-platform",
@@ -60,7 +65,9 @@ with DAG(
         return silver_to_gold.build_partition(
             partition["source"], partition["symbol"], partition["date"])
 
-    @task(trigger_rule="none_failed")
+    # The outlet is attached to the last task, so the asset is only published
+    # when every partition above it succeeded.
+    @task(trigger_rule="none_failed", outlets=[GOLD_ASSET])
     def summarize(results: list[dict]) -> dict:
         from pipelines.etl import silver_to_gold
 

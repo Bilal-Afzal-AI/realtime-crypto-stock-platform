@@ -79,6 +79,8 @@ x-airflow-common: &airflow-common
     # ETL code and the lake itself. Same files you see on the host, so what a
     # DAG writes can be inspected (and the bronze writer's output read) directly.
     - ../../pipelines:/opt/airflow/pipelines
+    # Warehouse loader (warehouse/loader.py), imported by the gold_to_warehouse DAG.
+    - ../../warehouse:/opt/airflow/warehouse
     - ../../data_lake:/opt/airflow/data_lake
   user: "${AIRFLOW_UID:-50000}:0"
   networks:
