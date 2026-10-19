@@ -62,12 +62,24 @@ x-airflow-common: &airflow-common
     # from a secrets backend in production.
     AIRFLOW_CONN_MARKET_WAREHOUSE: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-market}
     AIRFLOW_CONN_MARKET_KAFKA: '{"conn_type": "kafka", "extra": {"bootstrap.servers": "kafka:29092", "group.id": "airflow"}}'
+
+    # The ETL DAGs import their logic from the repo's pipelines/ package (kept
+    # out of the DAG files so it can be unit-tested without Airflow) and read
+    # and write the data lake. /opt/airflow is put on PYTHONPATH so
+    # `from pipelines.etl import ...` works, and DATA_LAKE_DIR tells that code
+    # where the mounted lake is.
+    PYTHONPATH: /opt/airflow
+    DATA_LAKE_DIR: /opt/airflow/data_lake
   volumes:
     # DAGs and plugins are bind-mounted from the repo so edits show up without
     # rebuilding the image. Logs land in orchestration/logs/ (git-ignored).
     - ../../orchestration/dags:/opt/airflow/dags
     - ../../orchestration/plugins:/opt/airflow/plugins
     - ../../orchestration/logs:/opt/airflow/logs
+    # ETL code and the lake itself. Same files you see on the host, so what a
+    # DAG writes can be inspected (and the bronze writer's output read) directly.
+    - ../../pipelines:/opt/airflow/pipelines
+    - ../../data_lake:/opt/airflow/data_lake
   user: "${AIRFLOW_UID:-50000}:0"
   networks:
     - airflow-internal
