@@ -176,7 +176,7 @@ cp .env.example .env    # then fill in API keys
 - [x] Lake writer consumer (bronze, raw JSON Lines): `streaming/consumers/bronze_writer.py`
 - [x] Bronze → silver (every 15 min) and silver → gold hourly OHLCV (hourly) Airflow DAGs, Parquet output: `orchestration/dags/`, `pipelines/etl/`
 - [ ] Warehouse star schema and ELT models
-- [ ] FastAPI endpoints with JWT auth
+- [x] FastAPI endpoints with JWT auth and rate limiting: [backend/README.md](backend/README.md)
 - [ ] Streamlit dashboard (live + historical)
 - [ ] Data quality checks, CI with tests and linting
 
