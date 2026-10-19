@@ -1,0 +1,47 @@
+# Application dependencies for the Real-Time Crypto and Stock Data Platform.
+#
+# Pinned to exact versions so every machine (yours, CI, Docker) builds the same
+# environment. Upgrade deliberately, one group at a time, and re-run tests.
+#
+# Apache Airflow is NOT in this file on purpose. It ships its own constraint
+# files and pins hundreds of transitive packages, which would fight with the
+# versions below. It lives in requirements-airflow.txt and, like in most
+# production teams, runs in its own container/environment.
+
+# --- Streaming: Kafka client -------------------------------------------------
+# confluent-kafka wraps librdkafka (C), the same client used in production at
+# scale. Much faster than the pure-Python kafka-python, and actively maintained.
+confluent-kafka==2.6.1
+
+# --- Ingestion: talking to market data APIs ---------------------------------
+httpx==0.28.1          # REST calls (sync + async) to exchange/stock APIs
+websockets==14.1       # live price streams (e.g. Binance/Coinbase websockets)
+tenacity==9.0.0        # retries with backoff when an API rate-limits or drops
+
+# --- Data processing + lake storage -----------------------------------------
+pandas==2.2.3
+pyarrow==18.1.0        # Parquet files for the data lake (columnar, compressed)
+
+# --- Warehouse access --------------------------------------------------------
+SQLAlchemy==2.0.36
+psycopg[binary]==3.2.3 # PostgreSQL driver (local warehouse stand-in)
+
+# --- Backend API + authentication -------------------------------------------
+fastapi==0.115.6
+uvicorn[standard]==0.34.0
+pydantic==2.10.4
+pydantic-settings==2.7.1  # typed config loaded from environment / .env
+PyJWT==2.10.1             # issue and verify JWT access tokens
+bcrypt==4.2.1             # password hashing
+python-multipart==0.0.20  # needed by FastAPI's OAuth2 password form
+
+# --- Dashboard ---------------------------------------------------------------
+streamlit==1.41.1
+plotly==5.24.1
+
+# --- Config ------------------------------------------------------------------
+python-dotenv==1.0.1
+
+# --- Dev / quality -----------------------------------------------------------
+pytest==8.3.4
+ruff==0.8.4            # linter + formatter in one fast tool

@@ -1,0 +1,14 @@
+# Workflow orchestrator: Apache Airflow.
+#
+# Airflow does not run natively on Windows. Run it with Docker (preferred, see
+# infra/ later) or inside WSL2, in a SEPARATE environment from requirements.txt.
+#
+# Always install Airflow with its official constraints file, otherwise pip may
+# resolve an untested combination of its ~300 dependencies:
+#
+#   pip install -r requirements-airflow.txt \
+#     --constraint "https://raw.githubusercontent.com/apache/airflow/constraints-3.0.2/constraints-3.12.txt"
+
+apache-airflow==3.0.2
+apache-airflow-providers-postgres
+apache-airflow-providers-apache-kafka
