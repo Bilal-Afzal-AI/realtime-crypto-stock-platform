@@ -11,7 +11,9 @@
 # --- Streaming: Kafka client -------------------------------------------------
 # confluent-kafka wraps librdkafka (C), the same client used in production at
 # scale. Much faster than the pure-Python kafka-python, and actively maintained.
-confluent-kafka==2.6.1
+# The [avro] extra adds the Schema Registry client and Avro serializer.
+confluent-kafka[avro]==2.6.1
+fastavro==1.13.1       # Avro encoder used by confluent-kafka's AvroSerializer
 
 # --- Ingestion: talking to market data APIs ---------------------------------
 httpx==0.28.1          # REST calls (sync + async) to exchange/stock APIs

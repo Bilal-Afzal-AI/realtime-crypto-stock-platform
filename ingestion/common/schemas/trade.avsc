@@ -1,0 +1,18 @@
+{
+  "type": "record",
+  "name": "Trade",
+  "namespace": "marketdata.ingestion",
+  "doc": "One executed trade, normalised from any source (Binance, Finnhub). Mirrors ingestion/common/events.py:Trade.",
+  "fields": [
+    {"name": "source", "type": "string", "doc": "Feed the trade came from: binance | finnhub"},
+    {"name": "symbol", "type": "string", "doc": "Symbol as the source names it, e.g. BTCUSDT, AAPL"},
+    {"name": "price", "type": "double"},
+    {"name": "size", "type": "double", "doc": "Base-asset quantity (coins or shares)"},
+    {"name": "trade_ts_ms", "type": {"type": "long", "logicalType": "timestamp-millis"},
+     "doc": "When the trade happened, per the exchange"},
+    {"name": "trade_id", "type": ["null", "string"], "default": null,
+     "doc": "Exchange trade id; Finnhub does not provide one"},
+    {"name": "ingest_ts_ms", "type": {"type": "long", "logicalType": "timestamp-millis"},
+     "doc": "When our producer received it"}
+  ]
+}

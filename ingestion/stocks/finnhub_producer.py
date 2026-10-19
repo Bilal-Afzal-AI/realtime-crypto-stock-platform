@@ -1,4 +1,4 @@
-"""Finnhub US stock trade stream producer (console output for now, Kafka later).
+"""Finnhub US stock trade stream producer: console log + Kafka topic `stocks.quotes`.
 
 Run:  python -m ingestion.stocks.finnhub_producer
 Needs FINNHUB_API_KEY in .env (free key at https://finnhub.io/register).
@@ -29,10 +29,12 @@ import os
 from dotenv import load_dotenv
 
 from ingestion.common.events import Trade
+from ingestion.common.kafka_publisher import TradePublisher
 from ingestion.common.ws_client import StreamConfig, run_producer, run_stream
 
 BASE_URL = "wss://ws.finnhub.io"
 DEFAULT_SYMBOLS = ["AAPL", "MSFT", "TSLA"]
+DEFAULT_TOPIC = "stocks.quotes"
 
 log = logging.getLogger("ingestion.finnhub")
 
@@ -68,6 +70,8 @@ async def main() -> None:
         )
     symbols = [s.strip().upper() for s in
                os.getenv("FINNHUB_SYMBOLS", ",".join(DEFAULT_SYMBOLS)).split(",")]
+    publisher = TradePublisher(os.getenv("FINNHUB_TOPIC", DEFAULT_TOPIC), "finnhub")
+    await publisher.ensure_schema()
 
     async def on_connect(ws) -> None:
         for symbol in symbols:
@@ -85,6 +89,7 @@ async def main() -> None:
             return
         for trade in parse_trades(msg):
             log.info(trade.log_line())
+            publisher.publish(trade)
 
     config = StreamConfig(
         name="finnhub",
@@ -94,7 +99,10 @@ async def main() -> None:
         # trigger this; a minute or two of total silence does.
         stale_after=120.0,
     )
-    await run_stream(config, on_connect, on_message)
+    try:
+        await run_stream(config, on_connect, on_message)
+    finally:
+        publisher.close()  # deliver whatever is still buffered
 
 
 if __name__ == "__main__":

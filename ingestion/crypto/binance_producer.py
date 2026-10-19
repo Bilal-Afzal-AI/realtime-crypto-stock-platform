@@ -1,4 +1,4 @@
-"""Binance spot trade stream producer (console output for now, Kafka later).
+"""Binance spot trade stream producer: console log + Kafka topic `crypto.trades`.
 
 Run:  python -m ingestion.crypto.binance_producer
 
@@ -28,10 +28,12 @@ import os
 from dotenv import load_dotenv
 
 from ingestion.common.events import Trade
+from ingestion.common.kafka_publisher import TradePublisher
 from ingestion.common.ws_client import StreamConfig, run_producer, run_stream
 
 DEFAULT_URL = "wss://stream.binance.com:9443/ws"
 DEFAULT_SYMBOLS = ["BTCUSDT", "ETHUSDT"]
+DEFAULT_TOPIC = "crypto.trades"
 
 log = logging.getLogger("ingestion.binance")
 
@@ -63,6 +65,8 @@ async def main() -> None:
     symbols = [s.strip().upper() for s in
                os.getenv("BINANCE_SYMBOLS", ",".join(DEFAULT_SYMBOLS)).split(",")]
     streams = [f"{s.lower()}@trade" for s in symbols]
+    publisher = TradePublisher(os.getenv("BINANCE_TOPIC", DEFAULT_TOPIC), "binance")
+    await publisher.ensure_schema()
 
     async def on_connect(ws) -> None:
         await ws.send(json.dumps({"method": "SUBSCRIBE", "params": streams, "id": 1}))
@@ -81,6 +85,7 @@ async def main() -> None:
         trade = parse_trade(msg)
         if trade:
             log.info(trade.log_line())
+            publisher.publish(trade)
 
     config = StreamConfig(
         name="binance",
@@ -88,7 +93,10 @@ async def main() -> None:
         # BTC trades many times per second, so 30s of silence means trouble.
         stale_after=30.0,
     )
-    await run_stream(config, on_connect, on_message)
+    try:
+        await run_stream(config, on_connect, on_message)
+    finally:
+        publisher.close()  # deliver whatever is still buffered
 
 
 if __name__ == "__main__":
