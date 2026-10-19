@@ -171,10 +171,10 @@ cp .env.example .env    # then fill in API keys
 
 - [x] Project scaffold, dependencies, architecture documentation
 - [x] Local infra in Docker: ZooKeeper + Kafka + Schema Registry + Kafka UI, PostgreSQL, Airflow (CeleryExecutor). See [infra/README.md](infra/README.md)
-- [ ] Crypto websocket producer → `crypto.trades` topic
-- [ ] Stock REST producer → `stocks.quotes` topic
-- [ ] Lake writer consumer (bronze Parquet)
-- [ ] Bronze → silver → gold ETL, scheduled by Airflow
+- [x] Crypto websocket producer (Binance) → `crypto.trades` topic
+- [x] Stock websocket producer (Finnhub) → `stocks.quotes` topic
+- [x] Lake writer consumer (bronze, raw JSON Lines): `streaming/consumers/bronze_writer.py`
+- [x] Bronze → silver (every 15 min) and silver → gold hourly OHLCV (hourly) Airflow DAGs, Parquet output: `orchestration/dags/`, `pipelines/etl/`
 - [ ] Warehouse star schema and ELT models
 - [ ] FastAPI endpoints with JWT auth
 - [ ] Streamlit dashboard (live + historical)
