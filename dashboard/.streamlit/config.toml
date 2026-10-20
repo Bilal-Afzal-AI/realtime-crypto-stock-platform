@@ -1,0 +1,21 @@
+# Dark, low-glare theme for financial data. Streamlit reads this file from the
+# folder you launch it in, so run `streamlit run app.py` from dashboard/.
+
+[theme]
+base = "dark"
+primaryColor = "#3d8bfd"
+backgroundColor = "#0b0e14"
+secondaryBackgroundColor = "#141922"
+textColor = "#e6e9ef"
+font = "sans serif"
+
+[server]
+headless = true
+# Listen on this machine only. Streamlit's default is every network interface,
+# which would publish the dashboard to your LAN (and, port-forwarded, beyond)
+# over plain HTTP.
+address = "127.0.0.1"
+port = 8501
+
+[browser]
+gatherUsageStats = false

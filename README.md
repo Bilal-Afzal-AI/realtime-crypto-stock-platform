@@ -177,7 +177,7 @@ cp .env.example .env    # then fill in API keys
 - [x] Bronze → silver (every 15 min) and silver → gold hourly OHLCV (hourly) Airflow DAGs, Parquet output: `orchestration/dags/`, `pipelines/etl/`
 - [ ] Warehouse star schema and ELT models
 - [x] FastAPI endpoints with JWT auth and rate limiting: [backend/README.md](backend/README.md)
-- [ ] Streamlit dashboard (live + historical)
+- [x] Streamlit dashboard (login, live overview, symbol detail charts): [dashboard/README.md](dashboard/README.md)
 - [ ] Data quality checks, CI with tests and linting
 
 ---
