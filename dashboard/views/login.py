@@ -4,12 +4,12 @@ import streamlit as st
 
 import api_client
 import session
+import theme
 
 _, centre, _ = st.columns([1, 1.2, 1])
 
 with centre:
-    st.title(":material/candlestick_chart: Market Dashboard")
-    st.caption("Live crypto and US stock candles from the data platform.")
+    theme.brand_header(compact=True)
 
     # One-time notice, e.g. "Your session expired".
     if flash := st.session_state.pop("flash", None):
