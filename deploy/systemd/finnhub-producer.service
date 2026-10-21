@@ -1,0 +1,15 @@
+[Unit]
+Description=Finnhub Stock Producer
+After=docker.service
+
+[Service]
+Type=simple
+User=ec2-user
+WorkingDirectory=/home/ec2-user/realtime-crypto-stock-platform
+ExecStart=/home/ec2-user/realtime-crypto-stock-platform/.venv/bin/python -m ingestion.stocks.finnhub_producer
+Restart=always
+RestartSec=5
+MemoryMax=256M
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,15 @@
+[Unit]
+Description=Backend API
+After=docker.service
+
+[Service]
+Type=simple
+User=ec2-user
+WorkingDirectory=/home/ec2-user/realtime-crypto-stock-platform
+ExecStart=/home/ec2-user/realtime-crypto-stock-platform/.venv/bin/python -m uvicorn backend.app.main:app --port 8000 --host 127.0.0.1
+Restart=always
+RestartSec=5
+MemoryMax=256M
+
+[Install]
+WantedBy=multi-user.target

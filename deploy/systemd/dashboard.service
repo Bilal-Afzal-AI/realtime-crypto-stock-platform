@@ -1,0 +1,15 @@
+[Unit]
+Description=Streamlit Dashboard
+After=docker.service
+
+[Service]
+Type=simple
+User=ec2-user
+WorkingDirectory=/home/ec2-user/realtime-crypto-stock-platform/dashboard
+ExecStart=/home/ec2-user/realtime-crypto-stock-platform/.venv/bin/python -m streamlit run app.py --server.port 8501 --server.headless true
+Restart=always
+RestartSec=5
+MemoryMax=256M
+
+[Install]
+WantedBy=multi-user.target
