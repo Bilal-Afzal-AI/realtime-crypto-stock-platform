@@ -15,8 +15,11 @@ aren't registered at all until login, there is nothing to reach by typing a URL.
 import streamlit as st
 
 import session
+import theme
 
-st.set_page_config(page_title="Market Dashboard", page_icon=":material/candlestick_chart:", layout="wide")
+st.set_page_config(page_title=f"{theme.PROJECT_NAME} · Dashboard", page_icon=":material/candlestick_chart:",
+                   layout="wide")
+theme.inject_css()   # before any page renders, so every page gets the branding and card styles
 
 session.check_expiry()
 
@@ -29,6 +32,7 @@ if session.is_signed_in():
     with st.sidebar:
         st.caption(f"Signed in as **{session.username()}**")
         st.button("Sign out", on_click=session.sign_out, icon=":material/logout:")
+    theme.brand_header()   # the login page draws its own, narrower version
 else:
     pages = [st.Page("views/login.py", title="Sign in", icon=":material/login:")]
 

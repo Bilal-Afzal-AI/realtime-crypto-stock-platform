@@ -3,7 +3,8 @@
 
 [theme]
 base = "dark"
-primaryColor = "#3d8bfd"
+# Brand accent; keep in sync with theme.ACCENT. Violet stays clear of the teal/red up/down colours.
+primaryColor = "#7c5cff"
 backgroundColor = "#0b0e14"
 secondaryBackgroundColor = "#141922"
 textColor = "#e6e9ef"

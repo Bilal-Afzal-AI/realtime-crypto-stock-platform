@@ -73,13 +73,19 @@ df = charts.candles_frame(data)
 first, last = df.iloc[0], df.iloc[-1]
 change = last["close"] - first["open"]
 
+# st.metric keeps the coloured up/down delta for free; theme.py's CSS turns each one into a card.
 m1, m2, m3, m4, m5 = st.columns(5)
-m1.metric("Last close", tables.fmt_price(last["close"]),
-          f"{change / first['open'] * 100:+.2f}% over range" if first["open"] else None)
-m2.metric("Range high", tables.fmt_price(df["high"].max()))
-m3.metric("Range low", tables.fmt_price(df["low"].min()))
-m4.metric("Total volume", tables.fmt_qty(df["volume"].sum()))
-m5.metric("Candles", f"{len(df):,}")
+m1.metric(":material/payments: Last close", tables.fmt_price(last["close"]),
+          f"{change / first['open'] * 100:+.2f}% over range" if first["open"] else None,
+          help="Close of the newest candle; the change compares it with the first candle's open.")
+m2.metric(":material/trending_up: Range high", tables.fmt_price(df["high"].max()),
+          help="Highest traded price in the selected range.")
+m3.metric(":material/trending_down: Range low", tables.fmt_price(df["low"].min()),
+          help="Lowest traded price in the selected range.")
+m4.metric(":material/bar_chart: Total volume", tables.fmt_qty(df["volume"].sum()),
+          help="Sum of traded quantity across every candle in the range.")
+m5.metric(":material/candlestick_chart: Candles", f"{len(df):,}",
+          help="Hourly candles in the range (at most 1,000 are fetched).")
 
 title = f"{sym['symbol']} · {sym['source']} · 1h candles (UTC)"
 st.plotly_chart(charts.candlestick_with_volume(df, title), use_container_width=True)
